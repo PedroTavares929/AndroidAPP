@@ -1,3 +1,4 @@
+// lib/ConnectionPage.dart
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
@@ -5,12 +6,18 @@ import 'package:flutter_bluetooth_serial/flutter_bluetooth_serial.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import 'ControlPage.dart';
+import 'theme_constants.dart'; // Import the new file
 
 class ConnectionPage extends StatefulWidget {
   final bool isDarkMode;
-  final Function(bool) onThemeChanged;
+  final AppThemeMode themeMode; // Use the shared enum
+  final Function(AppThemeMode) onThemeChanged;
 
-  ConnectionPage({required this.isDarkMode, required this.onThemeChanged});
+  ConnectionPage({
+    required this.isDarkMode,
+    required this.themeMode,
+    required this.onThemeChanged
+  });
 
   @override
   _ConnectionPageState createState() => _ConnectionPageState();
@@ -21,7 +28,10 @@ class _ConnectionPageState extends State<ConnectionPage> with TickerProviderStat
   bool isConnecting = false;
   bool isConnected = false;
   String statusMessage = "Ready to connect";
-  
+  List<BluetoothDevice> availableDevices = [];
+  BluetoothDevice? selectedDevice;
+  int connectionAttempt = 0;
+
   late AnimationController _pulseController;
   late AnimationController _rotationController;
   late Animation<double> _pulseAnimation;
@@ -30,17 +40,17 @@ class _ConnectionPageState extends State<ConnectionPage> with TickerProviderStat
   void initState() {
     super.initState();
     requestPermissions();
-    
+
     _pulseController = AnimationController(
       duration: Duration(seconds: 2),
       vsync: this,
     )..repeat(reverse: true);
-    
+
     _rotationController = AnimationController(
-      duration: Duration(seconds: 3),
+      duration: Duration(seconds: 2),
       vsync: this,
     );
-    
+
     _pulseAnimation = Tween<double>(
       begin: 0.8,
       end: 1.2,
@@ -48,6 +58,8 @@ class _ConnectionPageState extends State<ConnectionPage> with TickerProviderStat
       parent: _pulseController,
       curve: Curves.easeInOut,
     ));
+
+    _scanForDevices();
   }
 
   @override
@@ -66,58 +78,149 @@ class _ConnectionPageState extends State<ConnectionPage> with TickerProviderStat
     ].request();
   }
 
-  Future<void> connectToDevice() async {
+  Future<void> _scanForDevices() async {
+    try {
+      setState(() {
+        statusMessage = "Scanning for devices...";
+      });
+
+      List<BluetoothDevice> devices = await FlutterBluetoothSerial.instance.getBondedDevices();
+
+      setState(() {
+        availableDevices = devices;
+
+        // Try to find HeadlightController devices
+        BluetoothDevice? targetDevice;
+        for (BluetoothDevice device in devices) {
+          if (device.name != null &&
+              (device.name!.contains("Headlight") ||
+               device.name == "HeadlightController")) {
+            targetDevice = device;
+            break;
+          }
+        }
+
+        if (targetDevice != null) {
+          selectedDevice = targetDevice;
+          statusMessage = "Found: ${targetDevice.name}\nReady to connect!";
+        } else {
+          statusMessage = "Found ${devices.length} paired devices.\nSelect HeadlightController device.";
+        }
+      });
+
+    } catch (e) {
+      setState(() {
+        statusMessage = "Scan failed: $e";
+      });
+    }
+  }
+
+  Future<void> connectToDevice([BluetoothDevice? device]) async {
+    BluetoothDevice? targetDevice = device ?? selectedDevice;
+
+    if (targetDevice == null) {
+      setState(() {
+        statusMessage = "No device selected!";
+      });
+      return;
+    }
+
+    connectionAttempt++;
+
     setState(() {
       isConnecting = true;
-      statusMessage = "Scanning for devices...";
+      statusMessage = "Connecting to ${targetDevice!.name}...\nAttempt $connectionAttempt";
     });
 
     _rotationController.repeat();
 
     try {
-      List<BluetoothDevice> devices = await FlutterBluetoothSerial.instance.getBondedDevices();
-      
-      BluetoothDevice? targetDevice;
-      for (BluetoothDevice device in devices) {
-        if (device.name != null && device.name == "HeadlightController") {
-          targetDevice = device;
-          break;
-        }
+      // Close any existing connection first
+      try {
+        await connection?.close();
+      } catch (e) {
+        // Ignore errors when closing
       }
 
-      if (targetDevice == null) {
-        setState(() {
-          statusMessage = "HeadlightController not found. Please pair the device first.";
-          isConnecting = false;
-        });
-        _rotationController.stop();
-        return;
-      }
-
-      setState(() {
-        statusMessage = "Connecting to ${targetDevice?.name ?? 'HeadlightController'}...";
-      });
+      // Add a small delay to ensure previous connection is closed
+      await Future.delayed(Duration(milliseconds: 500));
 
       BluetoothConnection conn = await BluetoothConnection.toAddress(targetDevice.address);
-      
+
       setState(() {
         connection = conn;
         isConnected = true;
         isConnecting = false;
-        statusMessage = "Connected successfully!";
+        statusMessage = "Connected successfully!\nTesting communication...";
+        connectionAttempt = 0; // Reset on success
       });
 
       _rotationController.stop();
       _rotationController.reset();
 
-      // Navigate to Control Page
-      await Future.delayed(Duration(milliseconds: 500));
+      // Test communication with retry
+      await _testConnectionWithRetry(conn);
+
+    } catch (e) {
+      setState(() {
+        statusMessage = "Connection failed (attempt $connectionAttempt):\n${e.toString()}";
+        isConnecting = false;
+      });
+      _rotationController.stop();
+      _rotationController.reset();
+
+      // Auto retry up to 3 times for common errors
+      if (connectionAttempt < 3 && (e.toString().contains('socket') || e.toString().contains('timeout'))) {
+        await Future.delayed(Duration(milliseconds: 1000));
+        connectToDevice(targetDevice);
+      }
+    }
+  }
+
+  Future<void> _testConnectionWithRetry(BluetoothConnection conn) async {
+    int testAttempts = 0;
+    bool testSuccessful = false;
+
+    while (testAttempts < 3 && !testSuccessful) {
+      try {
+        testAttempts++;
+
+        // Send status request
+        String testCommand = '{"action": "status"}\n';
+        conn.output.add(Uint8List.fromList(utf8.encode(testCommand)));
+        await conn.output.allSent;
+
+        // Wait for response
+        await Future.delayed(Duration(milliseconds: 1000));
+
+        setState(() {
+          statusMessage = "Connection test successful!\nNavigating to controls...";
+        });
+
+        testSuccessful = true;
+
+      } catch (e) {
+        if (testAttempts >= 3) {
+          setState(() {
+            statusMessage = "Connection established but test failed.\nProceeding anyway...";
+          });
+          testSuccessful = true; // Proceed anyway
+        } else {
+          await Future.delayed(Duration(milliseconds: 500));
+        }
+      }
+    }
+
+    // Navigate to Control Page
+    await Future.delayed(Duration(milliseconds: 500));
+    if (mounted) {
       Navigator.of(context).pushReplacement(
         PageRouteBuilder(
           pageBuilder: (context, animation, secondaryAnimation) => ControlPage(
             connection: conn,
             isDarkMode: widget.isDarkMode,
-            onThemeChanged: widget.onThemeChanged,
+            themeMode: widget.themeMode, // Use the shared enum
+            onThemeChanged: widget.onThemeChanged, // Use the shared enum
           ),
           transitionsBuilder: (context, animation, secondaryAnimation, child) {
             return SlideTransition(
@@ -131,38 +234,163 @@ class _ConnectionPageState extends State<ConnectionPage> with TickerProviderStat
           transitionDuration: Duration(milliseconds: 300),
         ),
       );
-
-    } catch (e) {
-      setState(() {
-        statusMessage = "Connection failed: ${e.toString().split(':').last.trim()}";
-        isConnecting = false;
-      });
-      _rotationController.stop();
-      _rotationController.reset();
     }
+  }
+
+  void _showThemeDialog() {
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          backgroundColor: widget.isDarkMode ? Color(0xFF1A1A2E) : Colors.white,
+          title: Text(
+            'Theme Settings',
+            style: TextStyle(
+              color: widget.isDarkMode ? Colors.orange : Colors.blue,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _buildThemeOption(
+                title: 'System Default',
+                subtitle: 'Follow phone settings',
+                icon: Icons.phone_android,
+                isSelected: widget.themeMode == AppThemeMode.system,
+                onTap: () {
+                  widget.onThemeChanged(AppThemeMode.system);
+                  Navigator.pop(context);
+                },
+              ),
+              SizedBox(height: 12),
+              _buildThemeOption(
+                title: 'Light Mode',
+                subtitle: 'Always light theme',
+                icon: Icons.light_mode,
+                isSelected: widget.themeMode == AppThemeMode.light,
+                onTap: () {
+                  widget.onThemeChanged(AppThemeMode.light);
+                  Navigator.pop(context);
+                },
+              ),
+              SizedBox(height: 12),
+              _buildThemeOption(
+                title: 'Dark Mode',
+                subtitle: 'Always dark theme',
+                icon: Icons.dark_mode,
+                isSelected: widget.themeMode == AppThemeMode.dark,
+                onTap: () {
+                  widget.onThemeChanged(AppThemeMode.dark);
+                  Navigator.pop(context);
+                },
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: Text(
+                'Close',
+                style: TextStyle(
+                  color: widget.isDarkMode ? Colors.orange : Colors.blue,
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildThemeOption({
+    required String title,
+    required String subtitle,
+    required IconData icon,
+    required bool isSelected,
+    required VoidCallback onTap,
+  }) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: isSelected
+            ? (widget.isDarkMode ? Colors.orange.withOpacity(0.2) : Colors.blue.withOpacity(0.2))
+            : Colors.transparent,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: isSelected
+              ? (widget.isDarkMode ? Colors.orange : Colors.blue)
+              : Colors.grey.withOpacity(0.3),
+            width: isSelected ? 2 : 1,
+          ),
+        ),
+        child: Row(
+          children: [
+            Icon(
+              icon,
+              color: isSelected
+                ? (widget.isDarkMode ? Colors.orange : Colors.blue)
+                : Colors.grey,
+              size: 24,
+            ),
+            SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                      color: widget.isDarkMode ? Colors.white : Colors.black87,
+                    ),
+                  ),
+                  Text(
+                    subtitle,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: widget.isDarkMode ? Colors.white70 : Colors.black54,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (isSelected)
+              Icon(
+                Icons.check_circle,
+                color: widget.isDarkMode ? Colors.orange : Colors.blue,
+                size: 20,
+              ),
+          ],
+        ),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     final screenWidth = MediaQuery.of(context).size.width;
     final isTablet = screenWidth > 600;
-    
+
     return Scaffold(
       body: Container(
         decoration: BoxDecoration(
           gradient: LinearGradient(
             begin: Alignment.topLeft,
             end: Alignment.bottomRight,
-            colors: widget.isDarkMode 
+            colors: widget.isDarkMode
                 ? [
                     Color(0xFF0F0F23),
-                    Color(0xFF1A1A2E), 
+                    Color(0xFF1A1A2E),
                     Color(0xFF16213E),
                     Color(0xFF0F3460)
                   ]
                 : [
                     Color(0xFFE3F2FD),
-                    Color(0xFFBBDEFB), 
+                    Color(0xFFBBDEFB),
                     Color(0xFF90CAF9),
                     Color(0xFF64B5F6)
                   ],
@@ -176,18 +404,18 @@ class _ConnectionPageState extends State<ConnectionPage> with TickerProviderStat
             ),
             child: Column(
               children: [
-                // Header
                 _buildHeader(isTablet),
-                
                 Expanded(
-                  child: Center(
-                    child: SingleChildScrollView(
-                      child: _buildConnectionCard(isTablet),
+                  child: SingleChildScrollView(
+                    child: Column(
+                      children: [
+                        _buildConnectionCard(isTablet),
+                        SizedBox(height: 20),
+                        _buildDevicesList(isTablet),
+                      ],
                     ),
                   ),
                 ),
-                
-                // Footer
                 _buildFooter(),
               ],
             ),
@@ -205,8 +433,8 @@ class _ConnectionPageState extends State<ConnectionPage> with TickerProviderStat
           Container(
             padding: EdgeInsets.all(isTablet ? 16 : 12),
             decoration: BoxDecoration(
-              color: widget.isDarkMode 
-                ? Colors.orange.withOpacity(0.2) 
+              color: widget.isDarkMode
+                ? Colors.orange.withOpacity(0.2)
                 : Colors.blue.withOpacity(0.2),
               borderRadius: BorderRadius.circular(20),
               border: Border.all(
@@ -245,26 +473,51 @@ class _ConnectionPageState extends State<ConnectionPage> with TickerProviderStat
               ],
             ),
           ),
-          GestureDetector(
-            onTap: () => widget.onThemeChanged(!widget.isDarkMode),
-            child: Container(
-              padding: EdgeInsets.all(isTablet ? 16 : 12),
-              decoration: BoxDecoration(
-                color: widget.isDarkMode 
-                  ? Colors.orange.withOpacity(0.2) 
-                  : Colors.blue.withOpacity(0.2),
-                borderRadius: BorderRadius.circular(20),
-                border: Border.all(
-                  color: widget.isDarkMode ? Colors.orange : Colors.blue,
-                  width: 2,
+          Row(
+            children: [
+              // Refresh button
+              GestureDetector(
+                onTap: _scanForDevices,
+                child: Container(
+                  padding: EdgeInsets.all(isTablet ? 16 : 12),
+                  decoration: BoxDecoration(
+                    color: Colors.green.withOpacity(0.2),
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(color: Colors.green, width: 2),
+                  ),
+                  child: Icon(
+                    Icons.refresh_rounded,
+                    color: Colors.green,
+                    size: isTablet ? 28 : 20,
+                  ),
                 ),
               ),
-              child: Icon(
-                widget.isDarkMode ? Icons.light_mode : Icons.dark_mode,
-                color: widget.isDarkMode ? Colors.orange : Colors.blue,
-                size: isTablet ? 28 : 20,
+              SizedBox(width: 12),
+              // Theme toggle
+              GestureDetector(
+                onTap: _showThemeDialog,
+                child: Container(
+                  padding: EdgeInsets.all(isTablet ? 16 : 12),
+                  decoration: BoxDecoration(
+                    color: widget.isDarkMode
+                      ? Colors.orange.withOpacity(0.2)
+                      : Colors.blue.withOpacity(0.2),
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(
+                      color: widget.isDarkMode ? Colors.orange : Colors.blue,
+                      width: 2,
+                    ),
+                  ),
+                  child: Icon(
+                    widget.themeMode == AppThemeMode.system
+                      ? Icons.phone_android
+                      : (widget.isDarkMode ? Icons.dark_mode : Icons.light_mode),
+                    color: widget.isDarkMode ? Colors.orange : Colors.blue,
+                    size: isTablet ? 28 : 20,
+                  ),
+                ),
               ),
-            ),
+            ],
           ),
         ],
       ),
@@ -278,14 +531,14 @@ class _ConnectionPageState extends State<ConnectionPage> with TickerProviderStat
       ),
       margin: EdgeInsets.symmetric(vertical: 20),
       decoration: BoxDecoration(
-        color: widget.isDarkMode 
-          ? Color(0xFF1A1A2E).withOpacity(0.9) 
+        color: widget.isDarkMode
+          ? Color(0xFF1A1A2E).withOpacity(0.9)
           : Colors.white.withOpacity(0.9),
         borderRadius: BorderRadius.circular(30),
         boxShadow: [
           BoxShadow(
-            color: widget.isDarkMode 
-              ? Colors.black.withOpacity(0.3) 
+            color: widget.isDarkMode
+              ? Colors.black.withOpacity(0.3)
               : Colors.black.withOpacity(0.1),
             blurRadius: 30,
             offset: Offset(0, 15),
@@ -293,8 +546,8 @@ class _ConnectionPageState extends State<ConnectionPage> with TickerProviderStat
           ),
         ],
         border: Border.all(
-          color: widget.isDarkMode 
-            ? Colors.orange.withOpacity(0.3) 
+          color: widget.isDarkMode
+            ? Colors.orange.withOpacity(0.3)
             : Colors.blue.withOpacity(0.3),
           width: 2,
         ),
@@ -306,25 +559,22 @@ class _ConnectionPageState extends State<ConnectionPage> with TickerProviderStat
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              // Animated Bluetooth Icon
               _buildAnimatedIcon(isTablet),
-              
               SizedBox(height: isTablet ? 40 : 30),
-              
-              // Title
+
               Text(
-                'ESP32 CONTROLLER',
+                'HEADLIGHT CONTROL',
                 style: TextStyle(
-                  fontSize: isTablet ? 26 : 22,
+                  fontSize: isTablet ? 24 : 20,
                   fontWeight: FontWeight.bold,
                   color: widget.isDarkMode ? Colors.orange : Colors.blue,
-                  letterSpacing: 3,
+                  letterSpacing: 2,
                 ),
                 textAlign: TextAlign.center,
               ),
-              
+
               SizedBox(height: isTablet ? 30 : 20),
-              
+
               // Status Container
               Container(
                 width: double.infinity,
@@ -333,16 +583,10 @@ class _ConnectionPageState extends State<ConnectionPage> with TickerProviderStat
                   vertical: isTablet ? 20 : 15,
                 ),
                 decoration: BoxDecoration(
-                  color: widget.isDarkMode 
-                    ? Color(0xFF0F0F23).withOpacity(0.7) 
+                  color: widget.isDarkMode
+                    ? Color(0xFF0F0F23).withOpacity(0.7)
                     : Color(0xFFF5F5F5),
                   borderRadius: BorderRadius.circular(20),
-                  border: Border.all(
-                    color: widget.isDarkMode 
-                      ? Colors.orange.withOpacity(0.2) 
-                      : Colors.blue.withOpacity(0.2),
-                    width: 1,
-                  ),
                 ),
                 child: Column(
                   children: [
@@ -355,7 +599,7 @@ class _ConnectionPageState extends State<ConnectionPage> with TickerProviderStat
                     Text(
                       statusMessage,
                       style: TextStyle(
-                        fontSize: isTablet ? 16 : 14,
+                        fontSize: isTablet ? 14 : 12,
                         color: widget.isDarkMode ? Colors.white70 : Colors.black87,
                         height: 1.4,
                       ),
@@ -364,14 +608,157 @@ class _ConnectionPageState extends State<ConnectionPage> with TickerProviderStat
                   ],
                 ),
               ),
-              
-              SizedBox(height: isTablet ? 40 : 30),
-              
+
+              SizedBox(height: isTablet ? 30 : 20),
+
+              if (selectedDevice != null) ...[
+                // Selected Device Info
+                Container(
+                  width: double.infinity,
+                  padding: EdgeInsets.all(isTablet ? 20 : 16),
+                  decoration: BoxDecoration(
+                    color: Colors.green.withOpacity(0.1),
+                    borderRadius: BorderRadius.circular(15),
+                    border: Border.all(color: Colors.green, width: 2),
+                  ),
+                  child: Column(
+                    children: [
+                      Icon(Icons.bluetooth_connected, color: Colors.green, size: isTablet ? 24 : 20),
+                      SizedBox(height: 8),
+                      Text(
+                        selectedDevice!.name ?? 'Unknown Device',
+                        style: TextStyle(
+                          fontSize: isTablet ? 16 : 14,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.green,
+                        ),
+                      ),
+                      Text(
+                        selectedDevice!.address,
+                        style: TextStyle(
+                          fontSize: isTablet ? 12 : 10,
+                          color: Colors.green,
+                          fontFamily: 'monospace',
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                SizedBox(height: isTablet ? 20 : 16),
+              ],
+
               // Connect Button
               _buildConnectButton(isTablet),
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  Widget _buildDevicesList(bool isTablet) {
+    if (availableDevices.isEmpty) {
+      return Container();
+    }
+
+    return Container(
+      constraints: BoxConstraints(
+        maxWidth: isTablet ? 500 : double.infinity,
+      ),
+      decoration: BoxDecoration(
+        color: widget.isDarkMode
+          ? Color(0xFF1A1A2E).withOpacity(0.9)
+          : Colors.white.withOpacity(0.9),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(
+          color: widget.isDarkMode
+            ? Colors.orange.withOpacity(0.3)
+            : Colors.blue.withOpacity(0.3),
+          width: 2,
+        ),
+      ),
+      child: Column(
+        children: [
+          Container(
+            padding: EdgeInsets.all(isTablet ? 20 : 16),
+            child: Text(
+              'AVAILABLE DEVICES (${availableDevices.length})',
+              style: TextStyle(
+                fontSize: isTablet ? 18 : 16,
+                fontWeight: FontWeight.bold,
+                color: widget.isDarkMode ? Colors.orange : Colors.blue,
+                letterSpacing: 1,
+              ),
+            ),
+          ),
+          ListView.builder(
+            shrinkWrap: true,
+            physics: NeverScrollableScrollPhysics(),
+            itemCount: availableDevices.length,
+            itemBuilder: (context, index) {
+              BluetoothDevice device = availableDevices[index];
+              bool isSelected = selectedDevice?.address == device.address;
+              bool isHeadlightDevice = device.name != null && device.name!.contains("Headlight");
+
+              return Container(
+                margin: EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                decoration: BoxDecoration(
+                  color: isSelected
+                    ? Colors.green.withOpacity(0.2)
+                    : (isHeadlightDevice
+                        ? Colors.orange.withOpacity(0.1)
+                        : Colors.transparent),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: isSelected
+                      ? Colors.green
+                      : (isHeadlightDevice ? Colors.orange : Colors.grey.withOpacity(0.3)),
+                    width: isSelected ? 2 : 1,
+                  ),
+                ),
+                child: ListTile(
+                  dense: true,
+                  leading: Icon(
+                    isHeadlightDevice
+                      ? Icons.directions_car_rounded
+                      : Icons.bluetooth_rounded,
+                    color: isSelected
+                      ? Colors.green
+                      : (isHeadlightDevice ? Colors.orange : Colors.grey),
+                    size: isTablet ? 24 : 20,
+                  ),
+                  title: Text(
+                    device.name ?? 'Unknown Device',
+                    style: TextStyle(
+                      fontSize: isTablet ? 16 : 14,
+                      fontWeight: isHeadlightDevice ? FontWeight.bold : FontWeight.normal,
+                      color: widget.isDarkMode ? Colors.white : Colors.black87,
+                    ),
+                  ),
+                  subtitle: Text(
+                    device.address,
+                    style: TextStyle(
+                      fontSize: isTablet ? 12 : 10,
+                      color: widget.isDarkMode ? Colors.white70 : Colors.black54,
+                      fontFamily: 'monospace',
+                    ),
+                  ),
+                  trailing: isSelected
+                    ? Icon(Icons.check_circle, color: Colors.green)
+                    : null,
+                  onTap: () {
+                    setState(() {
+                      selectedDevice = device;
+                      connectionAttempt = 0; // Reset attempts when selecting new device
+                      statusMessage = "Selected: ${device.name}\nReady to connect!";
+                    });
+                  },
+                ),
+              );
+            },
+          ),
+          SizedBox(height: 16),
+        ],
       ),
     );
   }
@@ -404,8 +791,6 @@ class _ConnectionPageState extends State<ConnectionPage> with TickerProviderStat
                               Colors.cyan.shade600,
                               Colors.blue.shade800,
                             ],
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
                     ),
                     boxShadow: [
                       BoxShadow(
@@ -417,11 +802,11 @@ class _ConnectionPageState extends State<ConnectionPage> with TickerProviderStat
                     ],
                   ),
                   child: Icon(
-                    isConnected 
+                    isConnected
                         ? Icons.bluetooth_connected_rounded
-                        : isConnecting 
+                        : isConnecting
                             ? Icons.bluetooth_searching_rounded
-                            : Icons.bluetooth_rounded,
+                            : Icons.car_rental_rounded,
                     size: isTablet ? 60 : 50,
                     color: Colors.white,
                   ),
@@ -439,7 +824,7 @@ class _ConnectionPageState extends State<ConnectionPage> with TickerProviderStat
       width: double.infinity,
       height: isTablet ? 70 : 60,
       child: ElevatedButton(
-        onPressed: isConnecting ? null : connectToDevice,
+        onPressed: (isConnecting || selectedDevice == null) ? null : connectToDevice,
         style: ElevatedButton.styleFrom(
           backgroundColor: widget.isDarkMode ? Colors.orange : Colors.blue,
           foregroundColor: Colors.white,
@@ -477,16 +862,16 @@ class _ConnectionPageState extends State<ConnectionPage> with TickerProviderStat
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
                   Icon(
-                    Icons.bluetooth_connected_rounded,
+                    Icons.cable_rounded,
                     size: isTablet ? 28 : 24,
                   ),
                   SizedBox(width: 12),
                   Text(
-                    'CONNECT TO ESP32',
+                    selectedDevice != null ? 'CONNECT TO DEVICE' : 'SELECT A DEVICE',
                     style: TextStyle(
-                      fontSize: isTablet ? 20 : 18,
+                      fontSize: isTablet ? 18 : 16,
                       fontWeight: FontWeight.bold,
-                      letterSpacing: 2,
+                      letterSpacing: 1.5,
                     ),
                   ),
                 ],
@@ -498,14 +883,38 @@ class _ConnectionPageState extends State<ConnectionPage> with TickerProviderStat
   Widget _buildFooter() {
     return Container(
       padding: EdgeInsets.symmetric(vertical: 10),
-      child: Text(
-        'Make sure your device is paired with "HeadlightController"',
-        style: TextStyle(
-          fontSize: 12,
-          color: widget.isDarkMode ? Colors.white54 : Colors.black54,
-          fontStyle: FontStyle.italic,
-        ),
-        textAlign: TextAlign.center,
+      child: Column(
+        children: [
+          Text(
+            connectionAttempt > 0 ? 'Connection attempts: $connectionAttempt/3' : 'Tap device to select, then connect',
+            style: TextStyle(
+              fontSize: 12,
+              color: widget.isDarkMode ? Colors.white54 : Colors.black54,
+              fontStyle: FontStyle.italic,
+            ),
+            textAlign: TextAlign.center,
+          ),
+          SizedBox(height: 4),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                Icons.info_outline,
+                size: 12,
+                color: widget.isDarkMode ? Colors.orange.withOpacity(0.7) : Colors.blue.withOpacity(0.7),
+              ),
+              SizedBox(width: 4),
+              Text(
+                'Auto-retry on connection failures',
+                style: TextStyle(
+                  fontSize: 10,
+                  color: widget.isDarkMode ? Colors.orange.withOpacity(0.7) : Colors.blue.withOpacity(0.7),
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ],
+          ),
+        ],
       ),
     );
   }

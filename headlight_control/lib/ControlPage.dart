@@ -1,18 +1,22 @@
+// lib/ControlPage.dart
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_bluetooth_serial/flutter_bluetooth_serial.dart';
 import 'ConnectionPage.dart';
+import 'theme_constants.dart'; // Import the new file
 
 class ControlPage extends StatefulWidget {
   final BluetoothConnection connection;
   final bool isDarkMode;
-  final Function(bool) onThemeChanged;
+  final AppThemeMode themeMode; // Use the shared enum
+  final Function(AppThemeMode) onThemeChanged;
 
   ControlPage({
     required this.connection,
     required this.isDarkMode,
+    required this.themeMode,
     required this.onThemeChanged,
   });
 
@@ -21,6 +25,7 @@ class ControlPage extends StatefulWidget {
 }
 
 class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin {
+  // Motor status
   int leftPosition = 0;
   int rightPosition = 0;
   bool headlightsOn = false;
@@ -28,30 +33,37 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
   bool isAnimating = false;
   bool isConnected = true;
   String lastError = "";
-  
+  bool leftMoving = false;
+  bool rightMoving = false;
+
+  // Configuration
+  int leftDefaultPosition = 200;
+  int rightDefaultPosition = 200;
+  int animationSpeed = 3;
+  int motorTimeout = 3000;
+  int maxPosition = 320;
+  int minPosition = 0;
+
+  // CAN status
+  bool canInitialized = false;
+  int frameCount = 0;
+
   late AnimationController _breathingController;
-  late AnimationController _progressController;
   late Animation<double> _breathingAnimation;
-  
-  // Auto status update timer
+
   Timer? _statusTimer;
-  int _statusRequestCount = 0;
   bool _isDisposed = false;
+  StreamSubscription? _dataSubscription;
 
   @override
   void initState() {
     super.initState();
-    
+
     _breathingController = AnimationController(
       duration: Duration(seconds: 3),
       vsync: this,
     )..repeat(reverse: true);
-    
-    _progressController = AnimationController(
-      duration: Duration(milliseconds: 800),
-      vsync: this,
-    );
-    
+
     _breathingAnimation = Tween<double>(
       begin: 0.7,
       end: 1.0,
@@ -59,181 +71,164 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
       parent: _breathingController,
       curve: Curves.easeInOut,
     ));
-    
-    // Listen for incoming data with better error handling
-    widget.connection.input!.listen(
+
+    // Listen for incoming data
+    _dataSubscription = widget.connection.input!.listen(
       _onDataReceived,
       onError: (error) {
-        print("Connection error: $error");
         if (!_isDisposed && mounted) {
           setState(() {
             isConnected = false;
             lastError = "Connection lost: $error";
           });
-          _stopStatusTimer(); // Stop timer immediately
+          _stopStatusTimer();
         }
       },
       onDone: () {
-        print("Connection closed by remote");
-        _stopStatusTimer(); // Stop timer immediately
+        _stopStatusTimer();
         if (!_isDisposed && mounted) {
           _navigateToConnection();
         }
       },
     );
 
-    // Request initial status
+    // Request initial status and config
     _sendCommand({"action": "status"});
-    
-    // Start automatic status updates every 1 second
+    _sendCommand({"action": "config_get"});
+
+    // Start status updates
     _startStatusTimer();
   }
 
   @override
   void dispose() {
     _isDisposed = true;
-    _stopStatusTimer(); // Stop timer before disposing
+    _stopStatusTimer();
+    _dataSubscription?.cancel();
     _breathingController.dispose();
-    _progressController.dispose();
     super.dispose();
   }
 
-  // Check if connection is actually available before sending
+  void _startStatusTimer() {
+    _statusTimer?.cancel();
+    _statusTimer = Timer.periodic(Duration(seconds: 2), (timer) {
+      if (!_isDisposed && mounted && _canSendData()) {
+        _sendCommand({"action": "status"});
+      } else {
+        timer.cancel();
+      }
+    });
+  }
+
+  void _stopStatusTimer() {
+    _statusTimer?.cancel();
+    _statusTimer = null;
+  }
+
   bool _canSendData() {
     try {
       return widget.connection.isConnected && isConnected && !_isDisposed;
     } catch (e) {
-      print("Connection check failed: $e");
       return false;
     }
   }
 
-  // Start automatic status request timer
-  void _startStatusTimer() {
-    _statusTimer?.cancel(); // Cancel any existing timer
-    _statusTimer = Timer.periodic(Duration(milliseconds : 100), (timer) {
-      if (!_isDisposed && mounted && _canSendData()) {
-        _statusRequestCount++;
-        print("Auto status request #$_statusRequestCount");
-        _sendCommand({"action": "status"});
-      } else {
-        print("Timer stopped - disposed: $_isDisposed, mounted: $mounted, canSend: ${_canSendData()}");
-        timer.cancel();
-      }
-    });
-    print("✅ Auto status timer started (every 1 second)");
-  }
-
-  // Stop automatic status request timer
-  void _stopStatusTimer() {
-    _statusTimer?.cancel();
-    _statusTimer = null;
-    print("🛑 Auto status timer stopped");
-  }
-
   void _onDataReceived(Uint8List data) {
     if (_isDisposed || !mounted) return;
-    
+
     try {
       String message = String.fromCharCodes(data).trim();
       if (message.isEmpty) return;
 
-      print("Received: $message"); // Debug print
-      
-      // Handle multiple JSON objects in one message
       List<String> jsonLines = message.split('\n').where((line) => line.trim().isNotEmpty).toList();
-      
+
       for (String jsonLine in jsonLines) {
         try {
           Map<String, dynamic> json = jsonDecode(jsonLine);
-          
+
           if (json['type'] == 'status') {
             setState(() {
-              // Fix: Ensure we're getting the right values with null safety
-              leftPosition = (json['leftPosition'] is int) ? json['leftPosition'] : 0;
-              rightPosition = (json['rightPosition'] is int) ? json['rightPosition'] : 0;
-              headlightsOn = (json['headlightsOn'] is bool) ? json['headlightsOn'] : false;
-              motorsEnabled = (json['motorsEnabled'] is bool) ? json['motorsEnabled'] : false;
-              isAnimating = (json['isAnimating'] is bool) ? json['isAnimating'] : false;
+              leftPosition = json['leftPosition'] ?? 0;
+              rightPosition = json['rightPosition'] ?? 0;
+              headlightsOn = json['headlightsOn'] ?? false;
+              motorsEnabled = json['motorsEnabled'] ?? false;
+              isAnimating = json['isAnimating'] ?? false;
+              leftMoving = json['leftMoving'] ?? false;
+              rightMoving = json['rightMoving'] ?? false;
+              canInitialized = json['canInitialized'] ?? false;
+              frameCount = json['frameCount'] ?? 0;
+
               isConnected = true;
               lastError = "";
             });
-            
-            // Animate progress bars when positions change
-            if (!_progressController.isAnimating) {
-              _progressController.forward().then((_) {
-                if (!_isDisposed) _progressController.reset();
-              });
-            }
-            
-            print("Updated positions - Left: $leftPosition, Right: $rightPosition"); // Debug print
+          }
+          else if (json['type'] == 'config') {
+            setState(() {
+              leftDefaultPosition = json['left_default'] ?? 200;
+              rightDefaultPosition = json['right_default'] ?? 200;
+              animationSpeed = json['animation_speed'] ?? 3;
+              motorTimeout = json['motor_timeout'] ?? 3000;
+              maxPosition = json['max_position'] ?? 320;
+              minPosition = json['min_position'] ?? 0;
+            });
+          }
+          else if (json['type'] == 'success') {
+            // Success message received - no notification shown
+            print("Success: ${json['message'] ?? 'Success'}");
+          }
+          else if (json['type'] == 'error') {
+            setState(() {
+              lastError = json['message'] ?? 'Unknown error';
+            });
           }
         } catch (e) {
-          print("Error parsing JSON line '$jsonLine': $e");
+          // Ignore JSON parsing errors for individual lines
         }
       }
     } catch (e) {
-      print("Error processing data: $e");
       if (!_isDisposed && mounted) {
         setState(() {
-          lastError = "Data parsing error: $e";
+          lastError = "Data error: $e";
         });
       }
     }
   }
 
   Future<void> _sendCommand(Map<String, dynamic> command) async {
-    if (_isDisposed || !mounted) return;
-    
-    if (!_canSendData()) {
-      print("Cannot send data - connection not available");
-      setState(() {
-        isConnected = false;
-        lastError = "Connection not available";
-      });
-      _stopStatusTimer();
-      return;
-    }
+    if (_isDisposed || !mounted || !_canSendData()) return;
 
     try {
       String jsonString = jsonEncode(command);
-      print("Sending: $jsonString"); // Debug print
-      
       widget.connection.output.add(Uint8List.fromList(utf8.encode(jsonString + '\n')));
       await widget.connection.output.allSent;
-      
-      // Connection successful - restart timer if it was stopped
+
       if (!isConnected && !_isDisposed && mounted) {
         setState(() {
           isConnected = true;
           lastError = "";
         });
-        if (_statusTimer == null || !_statusTimer!.isActive) {
-          _startStatusTimer(); // Restart timer if connection was restored
-        }
       }
     } catch (e) {
-      print("Send error: $e");
       if (!_isDisposed && mounted) {
         setState(() {
           isConnected = false;
-          lastError = "Send failed: ${e.toString().split(':').last.trim()}";
+          lastError = "Send failed";
         });
-        _stopStatusTimer(); // Stop timer if send fails
+        _stopStatusTimer();
       }
     }
   }
 
   Future<void> _disconnect() async {
-    _isDisposed = true; // Prevent further operations
-    _stopStatusTimer(); // Stop timer before disconnecting
-    
+    _isDisposed = true;
+    _stopStatusTimer();
+
     try {
       await widget.connection.close();
     } catch (e) {
-      print("Disconnect error: $e");
+      // Ignore disconnect errors
     }
-    
+
     if (mounted) {
       _navigateToConnection();
     }
@@ -241,12 +236,13 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
 
   void _navigateToConnection() {
     if (!mounted) return;
-    
+
     Navigator.of(context).pushReplacement(
       PageRouteBuilder(
         pageBuilder: (context, animation, secondaryAnimation) => ConnectionPage(
           isDarkMode: widget.isDarkMode,
-          onThemeChanged: widget.onThemeChanged,
+          themeMode: widget.themeMode, // Use the shared enum
+          onThemeChanged: widget.onThemeChanged, // Use the shared enum
         ),
         transitionsBuilder: (context, animation, secondaryAnimation, child) {
           return SlideTransition(
@@ -262,29 +258,329 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
     );
   }
 
+  void _showConfigDialog() {
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        int tempLeftDefault = leftDefaultPosition;
+        int tempRightDefault = rightDefaultPosition;
+        int tempAnimSpeed = animationSpeed;
+        int tempMotorTimeout = motorTimeout;
+
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              backgroundColor: widget.isDarkMode ? Color(0xFF1A1A2E) : Colors.white,
+              title: Text(
+                'Motor Configuration',
+                style: TextStyle(
+                  color: widget.isDarkMode ? Colors.orange : Colors.blue,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    // Left Default Position
+                    Text(
+                      'Left Default Position: $tempLeftDefault',
+                      style: TextStyle(
+                        color: widget.isDarkMode ? Colors.white : Colors.black87,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    Text(
+                      'Where left motor goes after animation & center button',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: widget.isDarkMode ? Colors.white70 : Colors.black54,
+                      ),
+                    ),
+                    Slider(
+                      value: tempLeftDefault.toDouble(),
+                      min: 0,
+                      max: 320,
+                      divisions: 32,
+                      activeColor: Colors.blue,
+                      onChanged: (value) {
+                        setDialogState(() {
+                          tempLeftDefault = value.round();
+                        });
+                      },
+                    ),
+                    SizedBox(height: 16),
+
+                    // Right Default Position
+                    Text(
+                      'Right Default Position: $tempRightDefault',
+                      style: TextStyle(
+                        color: widget.isDarkMode ? Colors.white : Colors.black87,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    Text(
+                      'Where right motor goes after animation & center button',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: widget.isDarkMode ? Colors.white70 : Colors.black54,
+                      ),
+                    ),
+                    Slider(
+                      value: tempRightDefault.toDouble(),
+                      min: 0,
+                      max: 320,
+                      divisions: 32,
+                      activeColor: Colors.green,
+                      onChanged: (value) {
+                        setDialogState(() {
+                          tempRightDefault = value.round();
+                        });
+                      },
+                    ),
+                    SizedBox(height: 16),
+
+                    // Animation Speed
+                    Text(
+                      'Animation Speed: $tempAnimSpeed ms',
+                      style: TextStyle(
+                        color: widget.isDarkMode ? Colors.white : Colors.black87,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    Slider(
+                      value: tempAnimSpeed.toDouble(),
+                      min: 1,
+                      max: 20,
+                      divisions: 19,
+                      activeColor: Colors.orange,
+                      onChanged: (value) {
+                        setDialogState(() {
+                          tempAnimSpeed = value.round();
+                        });
+                      },
+                    ),
+                    SizedBox(height: 16),
+
+                    // Motor Timeout
+                    Text(
+                      'Motor Timeout: ${(tempMotorTimeout / 1000).toStringAsFixed(1)}s',
+                      style: TextStyle(
+                        color: widget.isDarkMode ? Colors.white : Colors.black87,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    Slider(
+                      value: tempMotorTimeout.toDouble(),
+                      min: 1000,
+                      max: 10000,
+                      divisions: 18,
+                      activeColor: Colors.purple,
+                      onChanged: (value) {
+                        setDialogState(() {
+                          tempMotorTimeout = value.round();
+                        });
+                      },
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: Text(
+                    'Cancel',
+                    style: TextStyle(color: Colors.grey),
+                  ),
+                ),
+                ElevatedButton(
+                  onPressed: () {
+                    _sendCommand({
+                      "action": "config_set",
+                      "left_default": tempLeftDefault,
+                      "right_default": tempRightDefault,
+                      "animation_speed": tempAnimSpeed,
+                      "motor_timeout": tempMotorTimeout,
+                    });
+
+                    setState(() {
+                      leftDefaultPosition = tempLeftDefault;
+                      rightDefaultPosition = tempRightDefault;
+                      animationSpeed = tempAnimSpeed;
+                      motorTimeout = tempMotorTimeout;
+                    });
+
+                    Navigator.pop(context);
+                  },
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: widget.isDarkMode ? Colors.orange : Colors.blue,
+                  ),
+                  child: Text('Save'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  void _showThemeDialog() {
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          backgroundColor: widget.isDarkMode ? Color(0xFF1A1A2E) : Colors.white,
+          title: Text(
+            'Theme Settings',
+            style: TextStyle(
+              color: widget.isDarkMode ? Colors.orange : Colors.blue,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _buildThemeOption(
+                title: 'System Default',
+                subtitle: 'Follow phone settings',
+                icon: Icons.phone_android,
+                isSelected: widget.themeMode == AppThemeMode.system,
+                onTap: () {
+                  widget.onThemeChanged(AppThemeMode.system);
+                  Navigator.pop(context);
+                },
+              ),
+              SizedBox(height: 12),
+              _buildThemeOption(
+                title: 'Light Mode',
+                subtitle: 'Always light theme',
+                icon: Icons.light_mode,
+                isSelected: widget.themeMode == AppThemeMode.light,
+                onTap: () {
+                  widget.onThemeChanged(AppThemeMode.light);
+                  Navigator.pop(context);
+                },
+              ),
+              SizedBox(height: 12),
+              _buildThemeOption(
+                title: 'Dark Mode',
+                subtitle: 'Always dark theme',
+                icon: Icons.dark_mode,
+                isSelected: widget.themeMode == AppThemeMode.dark,
+                onTap: () {
+                  widget.onThemeChanged(AppThemeMode.dark);
+                  Navigator.pop(context);
+                },
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: Text(
+                'Close',
+                style: TextStyle(
+                  color: widget.isDarkMode ? Colors.orange : Colors.blue,
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildThemeOption({
+    required String title,
+    required String subtitle,
+    required IconData icon,
+    required bool isSelected,
+    required VoidCallback onTap,
+  }) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: isSelected
+            ? (widget.isDarkMode ? Colors.orange.withOpacity(0.2) : Colors.blue.withOpacity(0.2))
+            : Colors.transparent,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: isSelected
+              ? (widget.isDarkMode ? Colors.orange : Colors.blue)
+              : Colors.grey.withOpacity(0.3),
+            width: isSelected ? 2 : 1,
+          ),
+        ),
+        child: Row(
+          children: [
+            Icon(
+              icon,
+              color: isSelected
+                ? (widget.isDarkMode ? Colors.orange : Colors.blue)
+                : Colors.grey,
+              size: 24,
+            ),
+            SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                      color: widget.isDarkMode ? Colors.white : Colors.black87,
+                    ),
+                  ),
+                  Text(
+                    subtitle,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: widget.isDarkMode ? Colors.white70 : Colors.black54,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (isSelected)
+              Icon(
+                Icons.check_circle,
+                color: widget.isDarkMode ? Colors.orange : Colors.blue,
+                size: 20,
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final screenWidth = MediaQuery.of(context).size.width;
     final screenHeight = MediaQuery.of(context).size.height;
     final isTablet = screenWidth > 600;
     final isLandscape = screenWidth > screenHeight;
-    
+
     return Scaffold(
       body: Container(
         decoration: BoxDecoration(
           gradient: LinearGradient(
             begin: Alignment.topLeft,
             end: Alignment.bottomRight,
-            colors: widget.isDarkMode 
+            colors: widget.isDarkMode
                 ? [
                     Color(0xFF0F0F23),
-                    Color(0xFF1A1A2E), 
+                    Color(0xFF1A1A2E),
                     Color(0xFF16213E),
                     Color(0xFF0F3460)
                   ]
                 : [
                     Color(0xFFE3F2FD),
-                    Color(0xFFBBDEFB), 
+                    Color(0xFFBBDEFB),
                     Color(0xFF90CAF9),
                     Color(0xFF64B5F6)
                   ],
@@ -293,10 +589,7 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
         child: SafeArea(
           child: Column(
             children: [
-              // Header
               _buildHeader(isTablet),
-              
-              // Content - FIX OVERFLOW with Flexible
               Flexible(
                 child: isLandscape && isTablet
                     ? _buildTabletLandscapeLayout()
@@ -316,8 +609,8 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
         vertical: isTablet ? 20 : 15,
       ),
       decoration: BoxDecoration(
-        color: widget.isDarkMode 
-          ? Color(0xFF1A1A2E).withOpacity(0.9) 
+        color: widget.isDarkMode
+          ? Color(0xFF1A1A2E).withOpacity(0.9)
           : Colors.white.withOpacity(0.9),
         boxShadow: [
           BoxShadow(
@@ -326,14 +619,6 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
             offset: Offset(0, 2),
           ),
         ],
-        border: Border(
-          bottom: BorderSide(
-            color: widget.isDarkMode 
-              ? Colors.orange.withOpacity(0.3) 
-              : Colors.blue.withOpacity(0.3),
-            width: 2,
-          ),
-        ),
       ),
       child: Row(
         children: [
@@ -354,9 +639,29 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
               ),
             ),
           ),
-          
-          SizedBox(width: 16),
-          
+
+          SizedBox(width: 12),
+
+          // Config Button
+          GestureDetector(
+            onTap: isConnected ? _showConfigDialog : null,
+            child: Container(
+              padding: EdgeInsets.all(isTablet ? 14 : 10),
+              decoration: BoxDecoration(
+                color: Colors.purple.withOpacity(0.2),
+                borderRadius: BorderRadius.circular(15),
+                border: Border.all(color: Colors.purple, width: 2),
+              ),
+              child: Icon(
+                Icons.settings_rounded,
+                color: Colors.purple,
+                size: isTablet ? 24 : 20,
+              ),
+            ),
+          ),
+
+          SizedBox(width: 12),
+
           // Status Info
           Expanded(
             child: Column(
@@ -394,7 +699,7 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
                       child: Text(
                         isConnected ? 'CONNECTED' : 'DISCONNECTED',
                         style: TextStyle(
-                          fontSize: isTablet ? 18 : 16,
+                          fontSize: isTablet ? 16 : 14,
                           fontWeight: FontWeight.bold,
                           color: widget.isDarkMode ? Colors.white : Colors.black87,
                           letterSpacing: 1,
@@ -415,27 +720,40 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
                     overflow: TextOverflow.ellipsis,
                   )
                 else
-                  Text(
-                    'Auto: ${_statusTimer?.isActive == true ? "ON" : "OFF"} | Count: $_statusRequestCount',
-                    style: TextStyle(
-                      fontSize: isTablet ? 14 : 12,
-                      color: widget.isDarkMode ? Colors.white70 : Colors.black54,
-                    ),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
+                  Row(
+                    children: [
+                      Text(
+                        'CAN: ${canInitialized ? "OK" : "FAIL"}',
+                        style: TextStyle(
+                          fontSize: isTablet ? 12 : 10,
+                          color: canInitialized
+                            ? Colors.green
+                            : (widget.isDarkMode ? Colors.white54 : Colors.black54),
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      SizedBox(width: 8),
+                      Text(
+                        'Frames: $frameCount',
+                        style: TextStyle(
+                          fontSize: isTablet ? 12 : 10,
+                          color: widget.isDarkMode ? Colors.white54 : Colors.black54,
+                        ),
+                      ),
+                    ],
                   ),
               ],
             ),
           ),
-          
+
           // Theme Toggle
           GestureDetector(
-            onTap: () => widget.onThemeChanged(!widget.isDarkMode),
+            onTap: _showThemeDialog,
             child: Container(
               padding: EdgeInsets.all(isTablet ? 14 : 10),
               decoration: BoxDecoration(
-                color: widget.isDarkMode 
-                  ? Colors.orange.withOpacity(0.2) 
+                color: widget.isDarkMode
+                  ? Colors.orange.withOpacity(0.2)
                   : Colors.blue.withOpacity(0.2),
                 borderRadius: BorderRadius.circular(15),
                 border: Border.all(
@@ -444,7 +762,9 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
                 ),
               ),
               child: Icon(
-                widget.isDarkMode ? Icons.light_mode : Icons.dark_mode,
+                widget.themeMode == AppThemeMode.system
+                  ? Icons.phone_android
+                  : (widget.isDarkMode ? Icons.dark_mode : Icons.light_mode),
                 color: widget.isDarkMode ? Colors.orange : Colors.blue,
                 size: isTablet ? 24 : 20,
               ),
@@ -459,7 +779,7 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
     return LayoutBuilder(
       builder: (context, constraints) {
         return SingleChildScrollView(
-          padding: EdgeInsets.all(isTablet ? 20 : 16), // Reduced padding for tablets
+          padding: EdgeInsets.all(isTablet ? 20 : 16),
           child: ConstrainedBox(
             constraints: BoxConstraints(
               minHeight: constraints.maxHeight - (isTablet ? 40 : 32),
@@ -467,7 +787,7 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
             child: Column(
               children: [
                 _buildStatusCard(isTablet),
-                SizedBox(height: isTablet ? 16 : 12), // Reduced spacing
+                SizedBox(height: isTablet ? 16 : 12),
                 _buildControlsCard(isTablet),
               ],
             ),
@@ -479,14 +799,14 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
 
   Widget _buildTabletLandscapeLayout() {
     return Padding(
-      padding: EdgeInsets.all(20), // Reduced padding
+      padding: EdgeInsets.all(20),
       child: Row(
         children: [
           Expanded(
             flex: 2,
             child: _buildStatusCard(true),
           ),
-          SizedBox(width: 16), // Reduced spacing
+          SizedBox(width: 16),
           Expanded(
             flex: 3,
             child: _buildControlsCard(true),
@@ -499,10 +819,10 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
   Widget _buildStatusCard(bool isTablet) {
     return Container(
       width: double.infinity,
-      padding: EdgeInsets.all(isTablet ? 24 : 20), // Reduced padding
+      padding: EdgeInsets.all(isTablet ? 24 : 20),
       decoration: BoxDecoration(
-        color: widget.isDarkMode 
-          ? Color(0xFF1A1A2E).withOpacity(0.9) 
+        color: widget.isDarkMode
+          ? Color(0xFF1A1A2E).withOpacity(0.9)
           : Colors.white.withOpacity(0.9),
         borderRadius: BorderRadius.circular(25),
         boxShadow: [
@@ -513,14 +833,14 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
           ),
         ],
         border: Border.all(
-          color: widget.isDarkMode 
-            ? Colors.orange.withOpacity(0.3) 
+          color: widget.isDarkMode
+            ? Colors.orange.withOpacity(0.3)
             : Colors.blue.withOpacity(0.3),
           width: 2,
         ),
       ),
       child: Column(
-        mainAxisSize: MainAxisSize.min, // Fix overflow
+        mainAxisSize: MainAxisSize.min,
         children: [
           // Title
           Row(
@@ -546,9 +866,9 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
               ),
             ],
           ),
-          
-          SizedBox(height: isTablet ? 24 : 20), // Reduced spacing
-          
+
+          SizedBox(height: isTablet ? 24 : 20),
+
           // Motor Position Displays
           Row(
             children: [
@@ -556,24 +876,28 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
                 child: _buildMotorDisplay(
                   'LEFT MOTOR',
                   leftPosition,
+                  leftDefaultPosition,
+                  leftMoving,
                   Colors.blue,
                   isTablet,
                 ),
               ),
-              SizedBox(width: isTablet ? 20 : 16), // Reduced spacing
+              SizedBox(width: isTablet ? 20 : 16),
               Expanded(
                 child: _buildMotorDisplay(
                   'RIGHT MOTOR',
                   rightPosition,
+                  rightDefaultPosition,
+                  rightMoving,
                   Colors.green,
                   isTablet,
                 ),
               ),
             ],
           ),
-          
-          SizedBox(height: isTablet ? 24 : 20), // Reduced spacing
-          
+
+          SizedBox(height: isTablet ? 24 : 20),
+
           // System Status
           _buildSystemStatus(isTablet),
         ],
@@ -581,19 +905,19 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
     );
   }
 
-  Widget _buildMotorDisplay(String title, int position, Color color, bool isTablet) {
-    double percentage = position / 320.0;
-    
+  Widget _buildMotorDisplay(String title, int position, int defaultPos, bool moving, Color color, bool isTablet) {
+    double percentage = position / maxPosition.toDouble();
+
     return Container(
-      padding: EdgeInsets.all(isTablet ? 16 : 12), // Reduced padding
+      padding: EdgeInsets.all(isTablet ? 16 : 12),
       decoration: BoxDecoration(
-        color: widget.isDarkMode 
-          ? Color(0xFF0F0F23).withOpacity(0.7) 
+        color: widget.isDarkMode
+          ? Color(0xFF0F0F23).withOpacity(0.7)
           : color.withOpacity(0.1),
         borderRadius: BorderRadius.circular(20),
         border: Border.all(
-          color: color.withOpacity(0.3),
-          width: 2,
+          color: moving ? color : color.withOpacity(0.3),
+          width: moving ? 3 : 2,
         ),
       ),
       child: Column(
@@ -608,26 +932,21 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
               letterSpacing: 1,
             ),
           ),
-          
-          SizedBox(height: isTablet ? 16 : 12), // Reduced spacing
-          
+
+          SizedBox(height: isTablet ? 16 : 12),
+
           // Circular Progress
           Stack(
             alignment: Alignment.center,
             children: [
               SizedBox(
-                width: isTablet ? 100 : 80, // Reduced size
-                height: isTablet ? 100 : 80, // Reduced size
-                child: AnimatedBuilder(
-                  animation: _progressController,
-                  builder: (context, child) {
-                    return CircularProgressIndicator(
-                      value: percentage,
-                      strokeWidth: isTablet ? 8 : 6,
-                      backgroundColor: color.withOpacity(0.2),
-                      valueColor: AlwaysStoppedAnimation<Color>(color),
-                    );
-                  },
+                width: isTablet ? 100 : 80,
+                height: isTablet ? 100 : 80,
+                child: CircularProgressIndicator(
+                  value: percentage,
+                  strokeWidth: isTablet ? 8 : 6,
+                  backgroundColor: color.withOpacity(0.2),
+                  valueColor: AlwaysStoppedAnimation<Color>(color),
                 ),
               ),
               Column(
@@ -636,42 +955,52 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
                   Text(
                     '$position',
                     style: TextStyle(
-                      fontSize: isTablet ? 20 : 16, // Reduced size
+                      fontSize: isTablet ? 20 : 16,
                       fontWeight: FontWeight.bold,
                       color: widget.isDarkMode ? Colors.white : Colors.black87,
                     ),
                   ),
                   Text(
-                    '/ 320',
+                    '/ $maxPosition',
                     style: TextStyle(
-                      fontSize: isTablet ? 12 : 10, // Reduced size
+                      fontSize: isTablet ? 12 : 10,
                       color: widget.isDarkMode ? Colors.white60 : Colors.black54,
                     ),
                   ),
                 ],
               ),
+              if (moving)
+                Positioned(
+                  top: 0,
+                  right: 0,
+                  child: Container(
+                    width: 12,
+                    height: 12,
+                    decoration: BoxDecoration(
+                      color: color,
+                      shape: BoxShape.circle,
+                    ),
+                  ),
+                ),
             ],
           ),
-          
-          SizedBox(height: isTablet ? 12 : 8), // Reduced spacing
-          
-          // Linear Progress Bar
-          ClipRRect(
-            borderRadius: BorderRadius.circular(10),
-            child: LinearProgressIndicator(
-              value: percentage,
-              backgroundColor: color.withOpacity(0.2),
-              valueColor: AlwaysStoppedAnimation<Color>(color),
-              minHeight: isTablet ? 6 : 4, // Reduced height
+
+          SizedBox(height: isTablet ? 12 : 8),
+
+          Text(
+            'Center: $defaultPos',
+            style: TextStyle(
+              fontSize: isTablet ? 12 : 10,
+              color: widget.isDarkMode ? Colors.white60 : Colors.black54,
             ),
           ),
-          
-          SizedBox(height: isTablet ? 8 : 6), // Reduced spacing
-          
+
+          SizedBox(height: isTablet ? 8 : 6),
+
           Text(
             '${(percentage * 100).toInt()}%',
             style: TextStyle(
-              fontSize: isTablet ? 14 : 12, // Reduced size
+              fontSize: isTablet ? 14 : 12,
               fontWeight: FontWeight.bold,
               color: color,
             ),
@@ -684,15 +1013,15 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
   Widget _buildSystemStatus(bool isTablet) {
     return Container(
       width: double.infinity,
-      padding: EdgeInsets.all(isTablet ? 16 : 12), // Reduced padding
+      padding: EdgeInsets.all(isTablet ? 16 : 12),
       decoration: BoxDecoration(
-        color: widget.isDarkMode 
-          ? Color(0xFF0F0F23).withOpacity(0.7) 
+        color: widget.isDarkMode
+          ? Color(0xFF0F0F23).withOpacity(0.7)
           : Colors.grey.shade100,
         borderRadius: BorderRadius.circular(20),
         border: Border.all(
-          color: widget.isDarkMode 
-            ? Colors.orange.withOpacity(0.3) 
+          color: widget.isDarkMode
+            ? Colors.orange.withOpacity(0.3)
             : Colors.blue.withOpacity(0.3),
           width: 2,
         ),
@@ -709,10 +1038,10 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
               letterSpacing: 1,
             ),
           ),
-          
-          SizedBox(height: isTablet ? 12 : 8), // Reduced spacing
-          
-          Wrap( // Use Wrap instead of Row for better responsive behavior
+
+          SizedBox(height: isTablet ? 12 : 8),
+
+          Wrap(
             alignment: WrapAlignment.spaceAround,
             spacing: 8,
             children: [
@@ -729,15 +1058,15 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
                 isTablet,
               ),
               _buildStatusIndicator(
-                'Auto-Update',
-                _statusTimer?.isActive ?? false,
-                Icons.update_rounded,
-                isTablet,
-              ),
-              _buildStatusIndicator(
                 'Animation',
                 isAnimating,
                 Icons.auto_awesome_rounded,
+                isTablet,
+              ),
+              _buildStatusIndicator(
+                'CAN Bus',
+                canInitialized,
+                Icons.cable_rounded,
                 isTablet,
               ),
             ],
@@ -752,10 +1081,10 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
       mainAxisSize: MainAxisSize.min,
       children: [
         Container(
-          padding: EdgeInsets.all(isTablet ? 10 : 8), // Reduced padding
+          padding: EdgeInsets.all(isTablet ? 10 : 8),
           decoration: BoxDecoration(
-            color: status 
-              ? Colors.green.withOpacity(0.2) 
+            color: status
+              ? Colors.green.withOpacity(0.2)
               : Colors.grey.withOpacity(0.2),
             borderRadius: BorderRadius.circular(12),
             border: Border.all(
@@ -766,26 +1095,26 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
           child: Icon(
             icon,
             color: status ? Colors.green : Colors.grey,
-            size: isTablet ? 20 : 16, // Reduced size
+            size: isTablet ? 20 : 16,
           ),
         ),
-        SizedBox(height: 6), // Reduced spacing
+        SizedBox(height: 6),
         Text(
           label,
           style: TextStyle(
-            fontSize: isTablet ? 10 : 8, // Reduced size
+            fontSize: isTablet ? 10 : 8,
             fontWeight: FontWeight.bold,
-            color: status 
-              ? Colors.green 
+            color: status
+              ? Colors.green
               : (widget.isDarkMode ? Colors.white60 : Colors.black54),
           ),
         ),
         Text(
           status ? 'ON' : 'OFF',
           style: TextStyle(
-            fontSize: isTablet ? 8 : 6, // Reduced size
-            color: status 
-              ? Colors.green 
+            fontSize: isTablet ? 8 : 6,
+            color: status
+              ? Colors.green
               : (widget.isDarkMode ? Colors.white38 : Colors.black38),
           ),
         ),
@@ -796,10 +1125,10 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
   Widget _buildControlsCard(bool isTablet) {
     return Container(
       width: double.infinity,
-      padding: EdgeInsets.all(isTablet ? 24 : 20), // Reduced padding
+      padding: EdgeInsets.all(isTablet ? 24 : 20),
       decoration: BoxDecoration(
-        color: widget.isDarkMode 
-          ? Color(0xFF1A1A2E).withOpacity(0.9) 
+        color: widget.isDarkMode
+          ? Color(0xFF1A1A2E).withOpacity(0.9)
           : Colors.white.withOpacity(0.9),
         borderRadius: BorderRadius.circular(25),
         boxShadow: [
@@ -810,14 +1139,14 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
           ),
         ],
         border: Border.all(
-          color: widget.isDarkMode 
-            ? Colors.orange.withOpacity(0.3) 
+          color: widget.isDarkMode
+            ? Colors.orange.withOpacity(0.3)
             : Colors.blue.withOpacity(0.3),
           width: 2,
         ),
       ),
       child: Column(
-        mainAxisSize: MainAxisSize.min, // Fix overflow
+        mainAxisSize: MainAxisSize.min,
         children: [
           // Title
           Row(
@@ -843,21 +1172,21 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
               ),
             ],
           ),
-          
-          SizedBox(height: isTablet ? 20 : 16), // Reduced spacing
-          
+
+          SizedBox(height: isTablet ? 20 : 16),
+
           // Quick Actions
           _buildQuickActions(isTablet),
-          
-          SizedBox(height: isTablet ? 16 : 12), // Reduced spacing
-          
+
+          SizedBox(height: isTablet ? 16 : 12),
+
+          // Independent Controls
+          _buildIndependentControls(isTablet),
+
+          SizedBox(height: isTablet ? 16 : 12),
+
           // Position Controls
           _buildPositionControls(isTablet),
-          
-          SizedBox(height: isTablet ? 16 : 12), // Reduced spacing
-          
-          // Special Functions
-          _buildSpecialFunctions(isTablet),
         ],
       ),
     );
@@ -870,49 +1199,144 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
         Text(
           'QUICK ACTIONS',
           style: TextStyle(
-            fontSize: isTablet ? 16 : 14, // Reduced size
+            fontSize: isTablet ? 16 : 14,
             fontWeight: FontWeight.bold,
             color: widget.isDarkMode ? Colors.white70 : Colors.black87,
             letterSpacing: 1,
           ),
         ),
-        SizedBox(height: isTablet ? 12 : 8), // Reduced spacing
-        _buildControlButton(
-          title: 'CENTER MOTORS',
-          icon: Icons.center_focus_strong_rounded,
-          onPressed: () => _sendCommand({"action": "center"}),
-          color: Colors.green,
-          isTablet: isTablet,
-          isFullWidth: true,
-        ),
-        SizedBox(height: 8), // Reduced spacing
+        SizedBox(height: isTablet ? 12 : 8),
         Row(
           children: [
             Expanded(
               child: _buildControlButton(
-                title: 'MAX UP',
-                icon: Icons.keyboard_double_arrow_up_rounded,
-                onPressed: () => _sendCommand({
-                  "action": "position_set", 
-                  "left": 320, 
-                  "right": 320
-                }),
-                color: Colors.purple,
+                title: 'ANIMATE',
+                icon: Icons.auto_awesome_rounded,
+                onPressed: () => _sendCommand({"action": "animate"}),
+                color: Colors.orange,
                 isTablet: isTablet,
               ),
             ),
-            SizedBox(width: 8), // Reduced spacing
+            SizedBox(width: 8),
             Expanded(
               child: _buildControlButton(
-                title: 'MAX DOWN',
-                icon: Icons.keyboard_double_arrow_down_rounded,
-                onPressed: () => _sendCommand({
-                  "action": "position_set", 
-                  "left": 0, 
-                  "right": 0
-                }),
-                color: Colors.purple,
+                title: 'CENTER',
+                icon: Icons.center_focus_strong_rounded,
+                onPressed: () => _sendCommand({"action": "center"}),
+                color: Colors.green,
                 isTablet: isTablet,
+              ),
+            ),
+          ],
+        ),
+        SizedBox(height: 8),
+        _buildControlButton(
+          title: 'CONFIG',
+          icon: Icons.settings_rounded,
+          onPressed: _showConfigDialog,
+          color: Colors.purple,
+          isTablet: isTablet,
+          isFullWidth: true,
+        ),
+      ],
+    );
+  }
+
+  Widget _buildIndependentControls(bool isTablet) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          'INDEPENDENT CONTROLS',
+          style: TextStyle(
+            fontSize: isTablet ? 16 : 14,
+            fontWeight: FontWeight.bold,
+            color: widget.isDarkMode ? Colors.white70 : Colors.black87,
+            letterSpacing: 1,
+          ),
+        ),
+        SizedBox(height: isTablet ? 12 : 8),
+        Row(
+          children: [
+            Expanded(
+              child: Column(
+                children: [
+                  Text(
+                    'LEFT MOTOR',
+                    style: TextStyle(
+                      fontSize: isTablet ? 12 : 10,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.blue,
+                    ),
+                  ),
+                  SizedBox(height: 4),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _buildControlButton(
+                          title: 'UP',
+                          icon: Icons.keyboard_arrow_up,
+                          onPressed: () => _sendCommand({"action": "move_left", "steps": 20}),
+                          color: Colors.blue,
+                          isTablet: isTablet,
+                          compact: true,
+                        ),
+                      ),
+                      SizedBox(width: 4),
+                      Expanded(
+                        child: _buildControlButton(
+                          title: 'DOWN',
+                          icon: Icons.keyboard_arrow_down,
+                          onPressed: () => _sendCommand({"action": "move_left", "steps": -20}),
+                          color: Colors.blue,
+                          isTablet: isTablet,
+                          compact: true,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                children: [
+                  Text(
+                    'RIGHT MOTOR',
+                    style: TextStyle(
+                      fontSize: isTablet ? 12 : 10,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.green,
+                    ),
+                  ),
+                  SizedBox(height: 4),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _buildControlButton(
+                          title: 'UP',
+                          icon: Icons.keyboard_arrow_up,
+                          onPressed: () => _sendCommand({"action": "move_right", "steps": 20}),
+                          color: Colors.green,
+                          isTablet: isTablet,
+                          compact: true,
+                        ),
+                      ),
+                      SizedBox(width: 4),
+                      Expanded(
+                        child: _buildControlButton(
+                          title: 'DOWN',
+                          icon: Icons.keyboard_arrow_down,
+                          onPressed: () => _sendCommand({"action": "move_right", "steps": -20}),
+                          color: Colors.green,
+                          isTablet: isTablet,
+                          compact: true,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
               ),
             ),
           ],
@@ -926,94 +1350,53 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
       mainAxisSize: MainAxisSize.min,
       children: [
         Text(
-          'MOVEMENT CONTROLS',
+          'POSITION CONTROLS',
           style: TextStyle(
-            fontSize: isTablet ? 16 : 14, // Reduced size
+            fontSize: isTablet ? 16 : 14,
             fontWeight: FontWeight.bold,
             color: widget.isDarkMode ? Colors.white70 : Colors.black87,
             letterSpacing: 1,
           ),
         ),
-        SizedBox(height: isTablet ? 12 : 8), // Reduced spacing
+        SizedBox(height: isTablet ? 12 : 8),
         Row(
           children: [
             Expanded(
               child: _buildControlButton(
-                title: 'MOVE UP',
-                icon: Icons.arrow_upward_rounded,
-                onPressed: () => _sendCommand({
-                  "action": "move", 
-                  "direction": "up"
-                }),
-                color: Colors.blue,
+                title: 'MAX UP',
+                icon: Icons.keyboard_double_arrow_up_rounded,
+                onPressed: () => _sendCommand({"action": "max_up"}),
+                color: Colors.red,
                 isTablet: isTablet,
               ),
             ),
-            SizedBox(width: 8), // Reduced spacing
+            SizedBox(width: 8),
             Expanded(
               child: _buildControlButton(
-                title: 'MOVE DOWN',
-                icon: Icons.arrow_downward_rounded,
-                onPressed: () => _sendCommand({
-                  "action": "move", 
-                  "direction": "down"
-                }),
-                color: Colors.blue,
-                isTablet: isTablet,
-              ),
-            ),
-          ],
-        ),
-      ],
-    );
-  }
-
-  Widget _buildSpecialFunctions(bool isTablet) {
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Text(
-          'SPECIAL FUNCTIONS',
-          style: TextStyle(
-            fontSize: isTablet ? 16 : 14, // Reduced size
-            fontWeight: FontWeight.bold,
-            color: widget.isDarkMode ? Colors.white70 : Colors.black87,
-            letterSpacing: 1,
-          ),
-        ),
-        SizedBox(height: isTablet ? 12 : 8), // Reduced spacing
-        Row(
-          children: [
-            Expanded(
-              child: _buildControlButton(
-                title: 'ANIMATE',
-                icon: Icons.auto_awesome_rounded,
-                onPressed: () => _sendCommand({"action": "animate"}),
-                color: Colors.orange,
-                isTablet: isTablet,
-              ),
-            ),
-            SizedBox(width: 8), // Reduced spacing
-            Expanded(
-              child: _buildControlButton(
-                title: 'TEST',
-                icon: Icons.build_rounded,
-                onPressed: () => _sendCommand({"action": "test"}),
+                title: 'MAX DOWN',
+                icon: Icons.keyboard_double_arrow_down_rounded,
+                onPressed: () => _sendCommand({"action": "max_down"}),
                 color: Colors.red,
                 isTablet: isTablet,
               ),
             ),
           ],
         ),
-        SizedBox(height: 8), // Reduced spacing
+        SizedBox(height: 8),
         _buildControlButton(
-          title: 'MANUAL STATUS ($_statusRequestCount)',
-          icon: Icons.refresh_rounded,
-          onPressed: () {
-            print("Manual status request triggered");
-            _sendCommand({"action": "status"});
-          },
-          color: Colors.teal,
+          title: 'MOVE BOTH UP',
+          icon: Icons.arrow_upward_rounded,
+          onPressed: () => _sendCommand({"action": "move_both", "steps": 20}),
+          color: Colors.indigo,
+          isTablet: isTablet,
+          isFullWidth: true,
+        ),
+        SizedBox(height: 8),
+        _buildControlButton(
+          title: 'MOVE BOTH DOWN',
+          icon: Icons.arrow_downward_rounded,
+          onPressed: () => _sendCommand({"action": "move_both", "steps": -20}),
+          color: Colors.indigo,
           isTablet: isTablet,
           isFullWidth: true,
         ),
@@ -1028,10 +1411,11 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
     required Color color,
     required bool isTablet,
     bool isFullWidth = false,
+    bool compact = false,
   }) {
     return Container(
       width: isFullWidth ? double.infinity : null,
-      height: isTablet ? 50 : 45, // Reduced height
+      height: compact ? (isTablet ? 35 : 30) : (isTablet ? 50 : 45),
       child: ElevatedButton(
         onPressed: (isConnected && !_isDisposed) ? onPressed : null,
         style: ElevatedButton.styleFrom(
@@ -1043,26 +1427,28 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
             borderRadius: BorderRadius.circular(18),
           ),
           disabledBackgroundColor: Colors.grey.shade400,
+          padding: EdgeInsets.symmetric(horizontal: compact ? 4 : 8),
         ),
         child: Row(
           mainAxisSize: isFullWidth ? MainAxisSize.max : MainAxisSize.min,
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon(icon, size: isTablet ? 20 : 16), // Reduced size
-            SizedBox(width: 6), // Reduced spacing
-            Flexible(
-              child: Text(
-                title,
-                style: TextStyle(
-                  fontSize: isTablet ? 14 : 12, // Reduced size
-                  fontWeight: FontWeight.bold,
-                  letterSpacing: 0.5,
+            Icon(icon, size: compact ? (isTablet ? 16 : 14) : (isTablet ? 20 : 16)),
+            if (!compact) SizedBox(width: 6),
+            if (!compact)
+              Flexible(
+                child: Text(
+                  title,
+                  style: TextStyle(
+                    fontSize: isTablet ? 14 : 12,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 0.5,
+                  ),
+                  textAlign: TextAlign.center,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                 ),
-                textAlign: TextAlign.center,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
               ),
-            ),
           ],
         ),
       ),
