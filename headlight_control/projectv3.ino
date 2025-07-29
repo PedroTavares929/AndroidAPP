@@ -17,15 +17,15 @@
 #define CAN_RX 22
 
 // Set to true when you have stepper drivers connected
-#define STEPPERS_CONNECTED false
+#define STEPPERS_CONNECTED true
 
 // Configuration structure
 struct Config {
   uint32_t magic = 0x12345678; // Magic number to validate EEPROM
   int leftDirPin = 4;
   int leftStepPin = 5;
-  int rightDirPin = 6;
-  int rightStepPin = 7;
+  int rightDirPin = 17;
+  int rightStepPin = 16;
   int enablePin = 2;
   int maxPosition = 320;
   int minPosition = 0;
@@ -553,7 +553,7 @@ void moveStepsNonBlocking(int leftSteps, int rightSteps) {
     leftStepTimer = millis();
     
     if (STEPPERS_CONNECTED) {
-      digitalWrite(config.leftDirPin, leftDirection ? HIGH : LOW);
+      digitalWrite(config.leftDirPin, leftDirection ? LOW : HIGH);
     }
   }
   
@@ -565,7 +565,7 @@ void moveStepsNonBlocking(int leftSteps, int rightSteps) {
     rightStepTimer = millis();
     
     if (STEPPERS_CONNECTED) {
-      digitalWrite(config.rightDirPin, rightDirection ? HIGH : LOW);
+      digitalWrite(config.rightDirPin, rightDirection ? LOW : HIGH);
     }
   }
   

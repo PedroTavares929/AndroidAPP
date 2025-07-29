@@ -43,6 +43,7 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
   int motorTimeout = 3000;
   int maxPosition = 320;
   int minPosition = 0;
+  int stepSize = 20;
 
   // CAN status
   bool canInitialized = false;
@@ -266,6 +267,7 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
         int tempRightDefault = rightDefaultPosition;
         int tempAnimSpeed = animationSpeed;
         int tempMotorTimeout = motorTimeout;
+        int tempStepSize = stepSize;
 
         return StatefulBuilder(
           builder: (context, setDialogState) {
@@ -339,6 +341,33 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
                       },
                     ),
                     SizedBox(height: 16),
+                    Text(
+                      'Step Size: $tempStepSize steps',
+                      style: TextStyle(
+                        color: widget.isDarkMode ? Colors.white : Colors.black87,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    Text(
+                      'How many steps UP/DOWN buttons move (1-50 steps)',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: widget.isDarkMode ? Colors.white70 : Colors.black54,
+                      ),
+                    ),
+                    Slider(
+                      value: tempStepSize.toDouble(),
+                      min: 1,
+                      max: 50,
+                      divisions: 49,
+                      activeColor: Colors.cyan,
+                      onChanged: (value) {
+                        setDialogState(() {
+                          tempStepSize = value.round();
+                        });
+                      },
+                    ),
+                    SizedBox(height: 16),
 
                     // Animation Speed
                     Text(
@@ -408,6 +437,7 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
                       rightDefaultPosition = tempRightDefault;
                       animationSpeed = tempAnimSpeed;
                       motorTimeout = tempMotorTimeout;
+                      stepSize = tempStepSize;
                     });
 
                     Navigator.pop(context);
@@ -1276,7 +1306,7 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
                         child: _buildControlButton(
                           title: 'UP',
                           icon: Icons.keyboard_arrow_up,
-                          onPressed: () => _sendCommand({"action": "move_left", "steps": 20}),
+                          onPressed: () => _sendCommand({"action": "move_left", "steps": stepSize}),
                           color: Colors.blue,
                           isTablet: isTablet,
                           compact: true,
@@ -1287,7 +1317,7 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
                         child: _buildControlButton(
                           title: 'DOWN',
                           icon: Icons.keyboard_arrow_down,
-                          onPressed: () => _sendCommand({"action": "move_left", "steps": -20}),
+                          onPressed: () => _sendCommand({"action": "move_left", "steps": -stepSize}),
                           color: Colors.blue,
                           isTablet: isTablet,
                           compact: true,
@@ -1317,7 +1347,7 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
                         child: _buildControlButton(
                           title: 'UP',
                           icon: Icons.keyboard_arrow_up,
-                          onPressed: () => _sendCommand({"action": "move_right", "steps": 20}),
+                          onPressed: () => _sendCommand({"action": "move_right", "steps": stepSize}),
                           color: Colors.green,
                           isTablet: isTablet,
                           compact: true,
@@ -1328,7 +1358,7 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
                         child: _buildControlButton(
                           title: 'DOWN',
                           icon: Icons.keyboard_arrow_down,
-                          onPressed: () => _sendCommand({"action": "move_right", "steps": -20}),
+                          onPressed: () => _sendCommand({"action": "move_right", "steps": -stepSize}),
                           color: Colors.green,
                           isTablet: isTablet,
                           compact: true,
@@ -1386,7 +1416,7 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
         _buildControlButton(
           title: 'MOVE BOTH UP',
           icon: Icons.arrow_upward_rounded,
-          onPressed: () => _sendCommand({"action": "move_both", "steps": 20}),
+          onPressed: () => _sendCommand({"action": "move_both", "steps": stepSize}),
           color: Colors.indigo,
           isTablet: isTablet,
           isFullWidth: true,
@@ -1395,7 +1425,7 @@ class _ControlPageState extends State<ControlPage> with TickerProviderStateMixin
         _buildControlButton(
           title: 'MOVE BOTH DOWN',
           icon: Icons.arrow_downward_rounded,
-          onPressed: () => _sendCommand({"action": "move_both", "steps": -20}),
+          onPressed: () => _sendCommand({"action": "move_both", "steps": -stepSize}),
           color: Colors.indigo,
           isTablet: isTablet,
           isFullWidth: true,
